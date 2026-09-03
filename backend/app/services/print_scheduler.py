@@ -2401,27 +2401,46 @@ class PrintScheduler:
                     )
                     continue
 
-            # If preference-only overrides exist, rank by color matches (existing behaviour)
+            # Every eligible printer is collected rather than returned on
+            # sight. Returning early made the choice depend on the order the
+            # database happened to return rows in — `_printers_for_model`
+            # issues no ORDER BY — so the same farm could dispatch differently
+            # between two runs with nothing changed.
             if pref_overrides:
                 color_matches = self._count_override_color_matches(printer.id, pref_overrides)
-                if color_matches > 0:
-                    candidates.append((printer.id, color_matches))
-                else:
+                if color_matches == 0:
                     override_colors = [f"{o.get('type', '?')} ({o.get('color', '?')})" for o in pref_overrides]
                     printers_missing_filament.append((printer.name, override_colors))
                     logger.debug("Skipping printer %s (%s) - no matching override colors", printer.id, printer.name)
                     continue
-            elif force_overrides:
-                # Passed all force checks — immediately eligible (no preference ordering needed)
-                return printer.id, None
+                candidates.append((printer.id, color_matches))
             else:
-                # No overrides at all - take first available (existing behavior)
-                return printer.id, None
+                # Force-matched or unconstrained: passed every check above, so
+                # eligible. No colour ranking applies, hence a score of zero —
+                # the tie-break below still orders these deterministically.
+                candidates.append((printer.id, 0))
 
-        # If we have candidates from preference override matching, pick the one with most color matches
         if candidates:
-            candidates.sort(key=lambda c: c[1], reverse=True)
-            return candidates[0][0], None
+            # Best fit, not first fit.
+            #
+            # 1. Most colour matches first — unchanged. A printer that already
+            #    carries more of what the job asks for is genuinely better.
+            # 2. Then the printer with the FEWEST filaments loaded. This is the
+            #    part that was missing: with a single-colour job and several
+            #    equally able printers, taking the four-spool AMS machine ties
+            #    up the only one that can serve a multi-colour job later, while
+            #    a single-spool printer sits idle. Preferring the least capable
+            #    printer that suffices keeps the versatile one available.
+            # 3. Then printer id, purely so the outcome is reproducible.
+            candidates.sort(key=lambda c: (-c[1], self._count_loaded_filaments(c[0]), c[0]))
+            chosen = candidates[0][0]
+            if len(candidates) > 1:
+                logger.debug(
+                    "Best-fit choice: printer %s from %s (matches, loaded, id)",
+                    chosen,
+                    [(pid, score, self._count_loaded_filaments(pid)) for pid, score in candidates],
+                )
+            return chosen, None
 
         # Build waiting reason from what we found
         reasons = []
@@ -2566,6 +2585,34 @@ class PrintScheduler:
                 missing.append(req_type)
 
         return missing
+
+    def _count_loaded_filaments(self, printer_id: int) -> int:
+        """How many distinct filaments a printer currently carries.
+
+        The measure of how much capability a dispatch would tie up: a
+        single-spool machine scores 1, a loaded four-slot AMS scores 4.
+        Distinct ``(type, colour)`` pairs, so two trays of the same black
+        count once — swapping one of them changes nothing about what the
+        printer can do.
+
+        An unreadable printer scores 0 and therefore sorts first. That is
+        deliberate: "we have never heard from it" must not make a printer look
+        expensive and push work onto a machine we know is versatile.
+        """
+        raw = self._tray_reading(printer_id)
+        loaded: set[tuple[str, str]] = set()
+        for ams_unit in raw.get("ams") or []:
+            for tray in ams_unit.get("tray", []):
+                tray_type = tray.get("tray_type")
+                if tray_type:
+                    colour = (tray.get("tray_color") or "").replace("#", "").lower()[:6]
+                    loaded.add((tray_type.upper(), colour))
+        for vt in raw.get("vt_tray") or []:
+            vt_type = vt.get("tray_type")
+            if vt_type:
+                colour = (vt.get("tray_color", "") or "").replace("#", "").lower()[:6]
+                loaded.add((vt_type.upper(), colour))
+        return len(loaded)
 
     def _count_override_color_matches(
         self, printer_id: int, overrides: list[dict], raw_data: dict | None = None
